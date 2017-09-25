@@ -1,163 +1,124 @@
-import { Pool, Notification, PoolConfig } from 'pg';
+import { Pool, Client, PoolConfig } from 'pg';
 import { get } from 'lodash';
 
-const pool = new Pool({
-  user: 'root',
-  password: 'password',
-  database: 'queue',
-  host: '192.168.1.1',
-  port: 5433,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-});
+const { escapeIdentifier, escapeLiteral } = Client.prototype;
 
-interface IHandler {
-  (payload: any, ack: () => void, nack: (error: Error) => void): void
+interface IHandler { (payload: any, ack: () => void, nack: (error: Error) => void): void };
+
+interface IConfig {
+  pool: PoolConfig;
+  poll_interval: number;
+  lock_timeout: number;
+};
+
+interface IPublishOptions {
+  delay?: number;
 }
 
-export const make_client = (config: PoolConfig) => {
-  const pool = new Pool(config);
+export const make_client = async (config: IConfig) => {
+  const pool = new Pool(config.pool);
+
+  await pool.query(`CREATE TABLE IF NOT EXISTS paused (queue VARCHAR primary key, state BOOLEAN)`);
+
+  const get_ready_job = async (queue_name: string) => {
+    const name = escapeIdentifier(queue_name);
+    const name_literal = escapeLiteral(queue_name);
+    const lock_timeout = escapeLiteral(config.lock_timeout.toString());
+    const results = await pool.query(`
+      UPDATE ${name}
+      SET status='locked', modified=CURRENT_TIMESTAMP
+      FROM (SELECT paused FROM paused WHERE name=${name_literal}) paused
+      WHERE id=(
+        SELECT id FROM ${name} WHERE ready <= CURRENT_TIMESTAMP ORDER BY created LIMIT 1
+      )
+      AND paused.paused='FALSE'
+      AND (
+        status='ready'
+        OR (
+          EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - modified)) > ${lock_timeout}
+          AND status='locked'
+        )
+      )
+      RETURNING payload, id
+    `);
+    if (results.rowCount < 1) {
+      return;
+    }
+    const id = get<number>(results, 'rows[0].id');
+    const payload = JSON.parse(get<string>(results, 'rows[0].payload'));
+    return { id, payload };
+  };
+
+  const make_ack = (queue_name: string, id: number) => async () => {
+    try {
+      const name = escapeIdentifier(queue_name);
+      await pool.query(`DELETE FROM ${name} WHERE id=${id}`);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const make_nack = (queue_name: string, id: number) => async () => {
+    try {
+      const name = escapeIdentifier(queue_name);
+      await pool.query(`UPDATE ${name} SET status='ready' WHERE id=${id}`);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const process_job = async (queue_name: string, handler: IHandler) => {
+    try {
+      const job = await get_ready_job(queue_name);
+      if (!job) return;
+      handler(job.payload, make_ack(queue_name, job.id), make_nack(queue_name, job.id));
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const sleep = (timeout: number) => new Promise(resolve => setTimeout(resolve, timeout));
 
   return {
-    make_queue: async (queue_name: string) => {
-      const client = await pool.connect();
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS ${client.escapeIdentifier(queue_name)} (
-          id serial primary key,
-          status varchar,
-          payload varchar,
-          created timestamp
+    make_queue: async (queue_name: string, options = { paused: false }) => {
+      const name = escapeIdentifier(queue_name);
+      const name_literal = escapeLiteral(queue_name);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS ${name} (
+          id serial primary key, status VARCHAR, payload VARCHAR,
+          created TIMESTAMP, modified TIMESTAMP, ready TIMESTAMP
         );
       `);
-    
-      await client.query(`
-        ALTER TABLE ${client.escapeIdentifier(queue_name)}
-        ALTER COLUMN created SET DEFAULT CURRENT_TIMESTAMP
+      await pool.query(`
+        INSERT INTO paused (name, paused)
+        VALUES (${name_literal}, ${options.paused ? 'TRUE' : 'FALSE'})
+        ON CONFLICT (name) DO NOTHING
       `);
-      
-      await client.query(`
-        ALTER TABLE ${client.escapeIdentifier(queue_name)}
-        ALTER COLUMN status SET DEFAULT 'ready'
-      `);
-    
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS ${client.escapeIdentifier(queue_name + '_lock')} (
-          id int primary key,
-          locked boolean,
-          created timestamp
-        );
-      `);
-    
-      await client.query(`
-        ALTER TABLE ${client.escapeIdentifier(queue_name + '_lock')}
-        ALTER COLUMN locked SET DEFAULT 'TRUE'
-      `);
-    
-      await client.query(`
-        ALTER TABLE ${client.escapeIdentifier(queue_name + '_lock')}
-        ALTER COLUMN created SET DEFAULT CURRENT_TIMESTAMP
-      `);
-    
-      await client.query(`
-        CREATE OR REPLACE FUNCTION ${client.escapeIdentifier('notify_' + queue_name)}()
-        RETURNS trigger AS $$
-        DECLARE
-        BEGIN
-          PERFORM pg_notify(${client.escapeLiteral(queue_name)}, 'update');
-          RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql;
-      `);
-    
-      await client.query(`
-        DO $$
-        BEGIN
-          IF EXISTS (
-            SELECT 1
-            FROM   pg_trigger
-            WHERE  NOT tgisinternal AND tgname = ${client.escapeLiteral(queue_name + '_update')}
-          ) THEN
-          ELSE
-            CREATE TRIGGER ${client.escapeIdentifier(queue_name + '_update')}
-              AFTER UPDATE OR INSERT ON ${client.escapeIdentifier(queue_name)}
-                FOR EACH ROW EXECUTE PROCEDURE ${client.escapeIdentifier('notify_' + queue_name)}();
-           END IF;
-        END
-        $$
-      `);
-      client.release();
+      await pool.query(`ALTER TABLE ${name} ALTER COLUMN created SET DEFAULT CURRENT_TIMESTAMP`);
+      await pool.query(`ALTER TABLE ${name} ALTER COLUMN modified SET DEFAULT CURRENT_TIMESTAMP`);
+      await pool.query(`ALTER TABLE ${name} ALTER COLUMN status SET DEFAULT 'ready'`);
     },
-    publish: async (queue_name: string, payload: any) => {
-      const client = await pool.connect();
-      await client.query(`
-        INSERT INTO ${client.escapeIdentifier(queue_name)} (payload) values (
-          ${client.escapeLiteral(JSON.stringify(payload))}
-        )
+    pause_queue: async (queue_name: string) => {
+      const name = escapeLiteral(queue_name);
+      await pool.query(`UPDATE paused SET paused='t' WHERE name=${name}`);
+    },
+    resume_queue: async (queue_name: string) => {
+      const name = escapeLiteral(queue_name);
+      await pool.query(`UPDATE paused SET paused='f' WHERE name=${name}`);
+    },
+    publish: async (queue_name: string, options: IPublishOptions = {}, data: any) => {
+      const name = escapeIdentifier(queue_name);
+      const payload = escapeLiteral(JSON.stringify(data));
+      const ready_date = `CURRENT_TIMESTAMP + INTERVAL '${Number(options.delay) || 0} milliseconds'`;
+      await pool.query(`
+        INSERT INTO ${name} (payload, ready) values (${payload}, ${ready_date})
       `);
-      client.release();
     },
     subscribe: async (queue_name: string, handler: IHandler) => {
-      const client = await pool.connect();
-      client.on('notification', async ({ channel }) => {
-        if (channel === queue_name) {
-          await client.query('BEGIN');
-          await client.query(`
-            DELETE FROM ${client.escapeIdentifier(queue_name + '_lock')}
-              WHERE EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - created) > 30
-          `)
-          const result = await client.query(`
-            SELECT ${client.escapeIdentifier(queue_name)}.id AS id, payload FROM
-              ${client.escapeIdentifier(queue_name)}
-            LEFT JOIN
-              ${client.escapeIdentifier(queue_name + '_lock')}
-            ON (${client.escapeIdentifier(queue_name)}.id = ${client.escapeIdentifier(queue_name + '_lock')}.id)
-            WHERE status = 'ready'
-            ORDER BY ${client.escapeIdentifier(queue_name)}.created
-            LIMIT 1
-          `);
-          if (result.rowCount === 1) {
-            const id = get<number>(result, 'rows[0].id');
-            try {
-              await client.query(`
-                INSERT INTO ${client.escapeIdentifier(queue_name + '_lock')} (id) values (
-                  ${client.escapeLiteral(id.toString())}
-                )
-              `);
-              const payload = get<string>(result, 'rows[0].payload');
-              const obj = JSON.parse(payload);
-              const ack = async () => {
-                await client.query('BEGIN');
-                await client.query(`
-                  UPDATE ${client.escapeIdentifier(queue_name)}
-                  SET status='delivered'
-                  WHERE id = ${client.escapeLiteral(id.toString())}
-                `);
-                await client.query(`
-                  DELETE FROM ${client.escapeIdentifier(queue_name + '_lock')}
-                  WHERE id = ${client.escapeLiteral(id.toString())}
-                `);
-                await client.query('COMMIT');
-              }
-      
-              const nack = async () => {
-                await client.query(`
-                  DELETE FROM ${client.escapeIdentifier(queue_name + '_lock')}
-                  WHERE id = ${client.escapeLiteral(id.toString())}
-                `);
-              }
-      
-              handler(obj, ack, nack);
-            } catch (e) { } finally {
-              await client.query('COMMIT');  
-            }
-          } else {
-            return await client.query('COMMIT');
-          }
-        }
-      })
-      await client.query(`LISTEN ${client.escapeIdentifier(queue_name)}`);
-      await client.query(`SELECT pg_notify(${client.escapeLiteral(queue_name)}, 'update')`);
+      while (true) {
+        await process_job(queue_name, handler);
+        await sleep(config.poll_interval);
+      }
     }
   }
 }
