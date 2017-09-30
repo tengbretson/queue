@@ -77,48 +77,66 @@ export const make_client = async (config: IConfig) => {
     }
   };
 
+  const assert_queue = async (queue_name: string) => {
+    const name = escapeIdentifier(queue_name);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ${name} (
+        id serial primary key, status VARCHAR, payload VARCHAR,
+        created TIMESTAMP, modified TIMESTAMP, ready TIMESTAMP
+      );
+    `);
+    await pool.query(`ALTER TABLE ${name} ALTER COLUMN created SET DEFAULT CURRENT_TIMESTAMP`);
+    await pool.query(`ALTER TABLE ${name} ALTER COLUMN modified SET DEFAULT CURRENT_TIMESTAMP`);
+    await pool.query(`ALTER TABLE ${name} ALTER COLUMN status SET DEFAULT 'ready'`);
+  };
+
   const sleep = (timeout: number) => new Promise(resolve => setTimeout(resolve, timeout));
 
   return {
     make_queue: async (queue_name: string, options = { paused: false }) => {
-      const name = escapeIdentifier(queue_name);
-      const name_literal = escapeLiteral(queue_name);
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS ${name} (
-          id serial primary key, status VARCHAR, payload VARCHAR,
-          created TIMESTAMP, modified TIMESTAMP, ready TIMESTAMP
-        );
-      `);
+      const name = escapeLiteral(queue_name);
+      const paused = options.paused ? 'TRUE' : 'FALSE';
+      await assert_queue(queue_name);
       await pool.query(`
         INSERT INTO paused (name, paused)
-        VALUES (${name_literal}, ${options.paused ? 'TRUE' : 'FALSE'})
-        ON CONFLICT (name) DO NOTHING
+        VALUES (${name}, ${paused})
+        ON CONFLICT (name) DO UPDATE SET paused=${paused}
       `);
-      await pool.query(`ALTER TABLE ${name} ALTER COLUMN created SET DEFAULT CURRENT_TIMESTAMP`);
-      await pool.query(`ALTER TABLE ${name} ALTER COLUMN modified SET DEFAULT CURRENT_TIMESTAMP`);
-      await pool.query(`ALTER TABLE ${name} ALTER COLUMN status SET DEFAULT 'ready'`);
     },
-    pause_queue: async (queue_name: string) => {
+    pause: async (queue_name: string) => {
       const name = escapeLiteral(queue_name);
-      await pool.query(`UPDATE paused SET paused='t' WHERE name=${name}`);
+      await pool.query(`
+        INSERT INTO paused (name, paused)
+        VALUES (${name}, 't')
+        ON CONFLICT (name) DO UPDATE SET paused='t'
+      `);
     },
-    resume_queue: async (queue_name: string) => {
+    resume: async (queue_name: string) => {
       const name = escapeLiteral(queue_name);
-      await pool.query(`UPDATE paused SET paused='f' WHERE name=${name}`);
+      await pool.query(`
+        INSERT INTO paused (name, paused)
+        VALUES (${name}, 'f')
+        ON CONFLICT (name) DO UPDATE SET paused='f'
+      `);
     },
     publish: async (queue_name: string, options: IPublishOptions = {}, data: any) => {
       const name = escapeIdentifier(queue_name);
       const payload = escapeLiteral(JSON.stringify(data));
       const ready_date = `CURRENT_TIMESTAMP + INTERVAL '${Number(options.delay) || 0} milliseconds'`;
+      await assert_queue(queue_name);
       await pool.query(`
         INSERT INTO ${name} (payload, ready) values (${payload}, ${ready_date})
       `);
     },
     subscribe: async (queue_name: string, handler: IHandler) => {
-      while (true) {
-        await process_job(queue_name, handler);
-        await sleep(config.poll_interval);
-      }
+      await assert_queue(queue_name);
+      (async () => {
+        while (true) {
+          await process_job(queue_name, handler);
+          await sleep(config.poll_interval);
+        }
+      })();
+      return;
     }
   }
 }
