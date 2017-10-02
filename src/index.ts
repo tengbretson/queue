@@ -3,19 +3,19 @@ import { get } from 'lodash';
 
 const { escapeIdentifier, escapeLiteral } = Client.prototype;
 
-interface IHandler { (payload: any, ack: () => void, nack: (error: Error) => void): void };
+export interface Handler { (payload: any, ack: () => void, nack: (error: Error) => void): Promise<void> };
 
-interface IConfig {
+export interface QueueConfig {
   pool: PoolConfig;
   poll_interval: number;
   lock_timeout: number;
 };
 
-interface IPublishOptions {
+export interface PublishConfig {
   delay?: number;
 }
 
-export const make_client = async (config: IConfig) => {
+export const make_client = async (config: QueueConfig) => {
   const pool = new Pool(config.pool);
 
   await pool.query(`CREATE TABLE IF NOT EXISTS paused (queue VARCHAR primary key, state BOOLEAN)`);
@@ -67,11 +67,11 @@ export const make_client = async (config: IConfig) => {
     }
   };
 
-  const process_job = async (queue_name: string, handler: IHandler) => {
+  const process_job = async (queue_name: string, handler: Handler) => {
     try {
       const job = await get_ready_job(queue_name);
       if (!job) return;
-      handler(job.payload, make_ack(queue_name, job.id), make_nack(queue_name, job.id));
+      await handler(job.payload, make_ack(queue_name, job.id), make_nack(queue_name, job.id));
     } catch (error) {
       console.error(error);
     }
@@ -119,7 +119,7 @@ export const make_client = async (config: IConfig) => {
         ON CONFLICT (name) DO UPDATE SET paused='f'
       `);
     },
-    publish: async (queue_name: string, options: IPublishOptions = {}, data: any) => {
+    publish: async (queue_name: string, options: PublishConfig = {}, data: any) => {
       const name = escapeIdentifier(queue_name);
       const payload = escapeLiteral(JSON.stringify(data));
       const ready_date = `CURRENT_TIMESTAMP + INTERVAL '${Number(options.delay) || 0} milliseconds'`;
@@ -128,7 +128,7 @@ export const make_client = async (config: IConfig) => {
         INSERT INTO ${name} (payload, ready) values (${payload}, ${ready_date})
       `);
     },
-    subscribe: async (queue_name: string, handler: IHandler) => {
+    subscribe: async (queue_name: string, handler: Handler) => {
       await assert_queue(queue_name);
       (async () => {
         while (true) {
