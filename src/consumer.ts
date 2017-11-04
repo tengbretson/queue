@@ -17,10 +17,11 @@ const config = {
 
 
 make_client(config).then(client => {
-  return client.make_queue('my_queue').then(() => {
-    return client.subscribe('my_queue', function (payload, ack, nack) {
-        console.log(payload);
-        ack();
-    });
-  }, e => console.error('pp', e));
+  return client.make_queue('my_queue')
+    .then(() => {
+        return client.subscribe('my_queue', payload => {
+            console.log(payload)
+            return Promise.resolve();
+        });
+    }, e => console.error('pp', e));
 }, e => console.error('l', e)).catch(err => console.error(err))
