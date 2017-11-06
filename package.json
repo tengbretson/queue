@@ -6,6 +6,8 @@
   "scripts": {
     "build": "tsc",
     "watch": "npm run build -- --watch",
+    "consumer": "node build/consumer",
+    "producer": "node build/producer",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
