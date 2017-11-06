@@ -9,6 +9,7 @@ export interface QueueConfig {
   poll_interval: number;
   lock_timeout: number;
   max_parallel: number;
+  empty_backoff: number;
   connection: Knex.ConnectionConfig;
 };
 
@@ -64,12 +65,24 @@ export const make_client = async (config: QueueConfig) => {
     const results = await knex(name)
       .update({ status: 'processing-locked', modified: CURRENT_TIMESTAMP })
       .whereExists(knex('paused').select('*').where({ name, paused: false }))
-      .andWhere(q => q.whereIn('id', knex(name)
+      .andWhere('id', '=', knex(name)
         .select('id')
-        .where('ready', '<=', CURRENT_TIMESTAMP)
-        .orderBy('created')
-        .limit(max_parallel)
-      ))
+        .whereIn('id', knex(name)
+          .select('id')
+          .where('ready', '<=', CURRENT_TIMESTAMP)
+          .orderBy('id')
+          .limit(max_parallel)
+        )
+        .andWhere(q => q
+          .where({ status: 'ready' })
+          .orWhere(q => q
+            .whereRaw('EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - modified)) > ?', [ lock_timeout ])
+            .andWhere({ status: 'processing-locked' })
+          )
+        )
+        .orderBy('id')
+        .limit(1)
+      )
       .andWhere(q => q
         .where({ status: 'ready' })
         .orWhere(q => q
@@ -78,7 +91,6 @@ export const make_client = async (config: QueueConfig) => {
         )
       )
       .returning(['payload', 'id']);
-
     if (results.length < 1) {
       return;
     }
@@ -89,7 +101,7 @@ export const make_client = async (config: QueueConfig) => {
 
   const process_job = async (name: string, handler: Handler) => {
     const job = await get_job_to_process(name);
-    if (!job) return;
+    if (!job) return await sleep(config.empty_backoff);
     const { id, payload } = job;
     try {
       await handler(payload)
@@ -102,7 +114,7 @@ export const make_client = async (config: QueueConfig) => {
 
   const complete_job = async (name: string, handler: Handler) => {
     const job = await get_job_to_complete(name);
-    if (!job) return;
+    if (!job) return await sleep(config.empty_backoff);
     const { id, payload } = job;
     try {
       await handler(payload);
@@ -115,7 +127,7 @@ export const make_client = async (config: QueueConfig) => {
 
   const assert_queue = async (name: string, { paused }: { paused?: boolean} = {}) => {
     await knex.schema.createTableIfNotExists(name, table => {
-      table.increments('id').primary();
+      table.bigIncrements('id').primary();
       table.string('status').defaultTo('ready');
       table.json('payload');
       table.timestamp('created').defaultTo(CURRENT_TIMESTAMP);
@@ -151,10 +163,12 @@ export const make_client = async (config: QueueConfig) => {
           ON CONFLICT (name) DO UPDATE SET paused='f'
         `, { name });
       },
-      publish: async (data: any, options: PublishConfig = {}) => {
+      enqueue: async (data: any, options: PublishConfig = {}) => {
         const payload = JSON.stringify(data);
-        const ready = `CURRENT_TIMESTAMP + INTERVAL '${Number(options.delay) || 0} milliseconds'`;
-        await knex(name).insert({ payload, ready });
+        await knex.raw(`
+          INSERT INTO :name: (payload, ready)
+          VALUES (:payload, CURRENT_TIMESTAMP + INTERVAL '${Number(options.delay) || 0} milliseconds')
+        `, { name, payload });
       },
       process: async (handler: Handler) => {
         const emitter = new EventEmitter();
@@ -162,7 +176,6 @@ export const make_client = async (config: QueueConfig) => {
           while (true) {
             try {
               await process_job(name, handler);
-              await sleep(config.poll_interval);
             } catch (error) {
               emitter.emit('error', error);
             }
@@ -176,7 +189,6 @@ export const make_client = async (config: QueueConfig) => {
           while (true) {
             try {
               await complete_job(name, handler);
-              await sleep(config.poll_interval);
             } catch (error) {
               emitter.emit('error', error);
             }
