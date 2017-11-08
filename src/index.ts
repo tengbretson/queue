@@ -28,10 +28,12 @@ export const make_client = async (config: QueueConfig) => {
   
   const CURRENT_TIMESTAMP = knex.raw('CURRENT_TIMESTAMP');
 
-  knex.schema.createTableIfNotExists('paused', table => {
-    table.string('queue').primary();
-    table.boolean('state');
-  });
+  if (!await knex.schema.hasTable('paused')) {
+    await knex.schema.createTableIfNotExists('paused', table => {
+      table.string('name').primary();
+      table.boolean('paused');
+    });
+  }
 
   const get_job_to_complete = async (name: string) => {
     const { lock_timeout } = config;
@@ -55,8 +57,8 @@ export const make_client = async (config: QueueConfig) => {
     if (results.length < 1) {
       return;
     }
-    const id = get<number>(results, '0.id');
-    const payload = JSON.parse(get<string>(results, '0.payload'));
+    const id: number = get(results, '0.id');
+    const payload: any = get(results, '0.payload');
     return { id, payload };
   };
 
@@ -94,8 +96,8 @@ export const make_client = async (config: QueueConfig) => {
     if (results.length < 1) {
       return;
     }
-    const id = get<number>(results, '0.id');
-    const payload = JSON.parse(get<string>(results, '0.payload'));
+    const id: number = get(results, '0.id');
+    const payload: any = get(results, '0.payload');
     return { id, payload };
   };
 

@@ -21,59 +21,27 @@ const config = {
 
 const sleep = (t: number) => new Promise(resolve => setTimeout(resolve, t));
 
-if (cluster.isMaster) {
-  let start_time: number;
-  console.log(`Master ${process.pid} is running`);
+(async () => {
+  const client = await make_client(config);
+  const queue = await client.assert_queue('my_queue');
 
-  (async () => {
-    for (let i = 0; i < 12; i++) {
-      var worker = cluster.fork();
-      worker.on('message', (msg) => {
-        if (msg == 1) {
-          start_time = Date.now();
-        }
-        if (msg == 10000) {
-          console.log(Date.now() - start_time);
-          process.exit(0);
-        }
-      });
-      await sleep(100);
-    }
+  const processor = await queue.process(async payload => {
+    await sleep(900); // simulate the part of the task that can be run concurrently
+    console.log('processed', payload.number, 'on', process.pid);
+    return;
+  });
 
-    cluster.on('exit', (worker, code, signal) => {
-      console.log(`worker ${worker.process.pid} died`);
-    });
-
-  })()
-
-} else {
-  (async () => {
-    const client = await make_client(config);
-    const queue = await client.assert_queue('my_queue');
+  processor.on('error', error => {
+    console.error(error);
+  })
   
-    const processor = await queue.process(async payload => {
-      console.log('processing', payload.number, 'on', process.pid);
-      await sleep(900);
-      console.log('processed', payload.number, 'on', process.pid);
-      return;
-    });
+  const sender = await queue.complete(async payload => {
+    await sleep(200); // simulate the part of the task that can must be run sequentially
+    console.log('sent', payload.number, 'on', process.pid);
+    return;
+  });
   
-    processor.on('error', error => {
-      console.error(error);
-    })
-    
-    const sender = await queue.complete(async payload => {
-      console.log('sending', payload.number, 'on', process.pid);
-      await sleep(200);
-      console.log('sent', payload.number, 'on', process.pid);
-      if (process.send) {
-        process.send(payload.number);
-      }
-      return;
-    });
-    
-    sender.on('error', error => {
-      console.error(error);
-    });
-  })();
-}
+  sender.on('error', error => {
+    console.error(error);
+  });
+})();

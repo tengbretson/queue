@@ -23,21 +23,10 @@ const sleep = (t: number) => new Promise(resolve => setTimeout(resolve, t));
 (async () => {
   const client = await make_client(config);
   const queue = await client.assert_queue('my_queue');
-  let t = 0;
 
-
-  const enqueue: () => Promise<void> = async () => {
-    await queue.enqueue({
-      number: ++t
-    });
-    console.log('sent', t);
+  for (let i = 0; i < 10000; i++) {
+    await queue.enqueue({ number: i });
+    console.log('sent', i);
     await sleep(40);
-    if (t < 10000) {
-      return await enqueue();
-    } else {
-      return process.exit(0);
-    }
-  };
-
-  await enqueue();
+  }
 })();

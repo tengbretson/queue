@@ -9,11 +9,11 @@ COPY package.json .
 # COPY package.json package-lock.json ./
 
 RUN npm install
-RUN npm run build
 # If you are building your code for production
 # RUN npm install --only=production
 
 # Bundle app source
 COPY . .
+RUN npm run build
 
 CMD [ "npm", "run", "consumer" ]
