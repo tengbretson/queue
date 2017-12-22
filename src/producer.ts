@@ -22,11 +22,11 @@ const sleep = (t: number) => new Promise(resolve => setTimeout(resolve, t));
 
 (async () => {
   const client = await make_client(config);
-  const queue = await client.assert_queue('my_queue');
-
-  for (let i = 0; i < 10000; i++) {
+  const queue = await client.assert_queue(13);
+  const i = 37;
+  // for (let i = 0; i < 10000; i++) {
     await queue.enqueue({ number: i });
     console.log('sent', i);
     await sleep(40);
-  }
+  // }
 })();

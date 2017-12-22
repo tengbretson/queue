@@ -1,6 +1,7 @@
-import { get } from 'lodash';
+import { get, range } from 'lodash';
 import * as Knex from 'knex';
 import { EventEmitter } from 'events';
+import { v4 as uuid } from 'uuid';
 
 export interface Handler { (payload: any): Promise<void> };
 
@@ -19,189 +20,168 @@ export interface PublishConfig {
 
 const sleep = (t: number) => new Promise(resolve => setTimeout(resolve, t));
 
-export const make_client = async (config: QueueConfig) => {
-  const knex = Knex({
-    client: 'pg',
-    pool: config.pool,
-    connection: config.connection
-  });
-  
-  const CURRENT_TIMESTAMP = knex.raw('CURRENT_TIMESTAMP');
-
+const initialize_paused = async (knex: Knex) => {
   if (!await knex.schema.hasTable('paused')) {
     await knex.schema.createTableIfNotExists('paused', table => {
-      table.string('name').primary();
+      table.integer('queue_id').notNullable().primary();
       table.boolean('paused');
     });
   }
+};
 
-  const get_job_to_complete = async (name: string) => {
-    const { lock_timeout } = config;
-    const results = await knex(name)
-      .update({ status: 'completing-locked', modified: CURRENT_TIMESTAMP })
-      .whereExists(knex('paused').select('*').where({ name, paused: false }))
-      .andWhere('id', '=', knex(name)
-        .select('id')
-        .orderBy('created')
-        .limit(1)
-      )
-      .andWhere(q => q
-        .where({ status: 'processed' })
-        .orWhere(q => q
-          .whereRaw('EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - modified)) > ?', [ lock_timeout ])
-          .andWhere({ status: 'completing-locked' })
-        )
-      )
-      .returning(['payload', 'id']);
+const initialize_queue = async (knex: Knex) => {
+  if (!await knex.schema.hasTable('queue')) {
+    const CURRENT_TIMESTAMP = knex.raw('CURRENT_TIMESTAMP');
+    await knex.schema.createTableIfNotExists('queue', table => {
+      table.bigIncrements('id').primary();
+      table.integer('queue_id').references('queue_id').inTable('paused').notNullable();
+      table.string('status').notNullable().defaultTo('ready');
+      table.json('concurrent_payload');
+      table.json('sequential_payload');
+      table.timestamp('queued_at').notNullable().defaultTo(CURRENT_TIMESTAMP);
+      table.timestamp('locked_at');
+    });
+  }
+};
 
-    if (results.length < 1) {
-      return;
-    }
-    const id: number = get(results, '0.id');
-    const payload: any = get(results, '0.payload');
-    return { id, payload };
-  };
+export const make_client = async (config: QueueConfig) => {
+  const { pool, connection, lock_timeout } = config;
+  const knex = Knex({ client: 'pg', pool, connection });
 
-  const get_job_to_process = async (name: string) => {
-    const { lock_timeout, max_parallel } = config;
-    const results = await knex(name)
-      .update({ status: 'processing-locked', modified: CURRENT_TIMESTAMP })
-      .whereExists(knex('paused').select('*').where({ name, paused: false }))
-      .andWhere('id', '=', knex(name)
-        .select('id')
-        .whereIn('id', knex(name)
-          .select('id')
-          .where('ready', '<=', CURRENT_TIMESTAMP)
-          .orderBy('id')
-          .limit(max_parallel)
-        )
-        .andWhere(q => q
-          .where({ status: 'ready' })
-          .orWhere(q => q
-            .whereRaw('EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - modified)) > ?', [ lock_timeout ])
-            .andWhere({ status: 'processing-locked' })
+  const concurrent_processors = new Map<string, Handler>();
+  const sequential_processors = new Map<string, Handler>();
+
+  await initialize_paused(knex);
+  await initialize_queue(knex);
+  
+
+
+  const get_job = async (last_queue = 0) => {
+    const { rows } = await knex.raw(`
+    UPDATE queue
+    SET
+      locked_at = NOW(),
+      status = CASE WHEN (status = 'ready' OR status = 'locked-concurrent')
+        THEN 'locked-concurrent'
+        ELSE 'locked-sequential'
+      END
+    WHERE queue.id = (
+      SELECT queue.id FROM queue INNER JOIN paused ON queue.queue_id = paused.queue_id
+      WHERE paused.paused = false
+      AND queue.queue_id > :last_queue
+      AND (
+        queue.status = 'ready' OR (
+          queue.status = 'locked-concurrent'
+            AND EXTRACT(
+              EPOCH FROM (NOW() - queue.locked_at)
+            ) > :lock_timeout
+          ) OR (
+            queue.id IN (select distinct on (queue_id) id FROM queue ORDER BY queue_id, queued_at ASC, id)
+              AND queue.status = 'processed-concurrent' OR (
+                queue.status = 'locked-sequential'
+                  AND EXTRACT(
+                    EPOCH FROM (NOW() - queue.locked_at)
+                  ) > :lock_timeout
+              )
           )
         )
-        .orderBy('id')
-        .limit(1)
-      )
-      .andWhere(q => q
-        .where({ status: 'ready' })
-        .orWhere(q => q
-          .whereRaw('EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - modified)) > ?', [ lock_timeout ])
-          .andWhere({ status: 'processing-locked' })
-        )
-      )
-      .returning(['payload', 'id']);
-    if (results.length < 1) {
+      ORDER BY queue.queue_id, queue.queued_at
+      LIMIT 1
+      FOR UPDATE
+    )
+    RETURNING
+      id,
+      queue_id,
+      status,
+      CASE WHEN (status = 'locked-concurrent')
+        THEN concurrent_payload
+        ELSE sequential_payload
+      END as payload
+    `, { lock_timeout, last_queue });
+    if (rows.length < 1) {
       return;
     }
-    const id: number = get(results, '0.id');
-    const payload: any = get(results, '0.payload');
-    return { id, payload };
+    const queue_id: number = get(rows, '0.queue_id');
+    const status: number = get(rows, '0.status');
+    const id: number = get(rows, '0.id');
+    const payload: any = get(rows, '0.payload');
+    return { id, status, queue_id, payload };
   };
 
-  const process_job = async (name: string, handler: Handler) => {
-    const job = await get_job_to_process(name);
-    if (!job) return await sleep(config.empty_backoff);
-    const { id, payload } = job;
-    try {
-      await handler(payload)
-      await knex(name).where({ id }).update({ status: 'processed' });
-    } catch (error) {
-      console.error('Processing failed with error:', error);
-      await knex(name).where({ id }).update({ status: 'error' });
-    }
-  };
 
-  const complete_job = async (name: string, handler: Handler) => {
-    const job = await get_job_to_complete(name);
-    if (!job) return await sleep(config.empty_backoff);
-    const { id, payload } = job;
-    try {
-      await handler(payload);
-      await knex(name).where({ id }).delete();
-    } catch (error) {
-      console.error('Completing failed with error:', error);
-      await knex(name).where({ id }).update({ status: 'error' });
-    }
-  };
+  const register_concurrent = (queue_name: string, handler: Handler) =>
+    concurrent_processors.set(queue_name, handler);
 
-  const assert_queue = async (name: string, { paused }: { paused?: boolean} = {}) => {
-    await knex.schema.createTableIfNotExists(name, table => {
-      table.bigIncrements('id').primary();
-      table.string('status').defaultTo('ready');
-      table.json('payload');
-      table.timestamp('created').defaultTo(CURRENT_TIMESTAMP);
-      table.timestamp('modified').defaultTo(CURRENT_TIMESTAMP);
-      table.timestamp('ready');
-    });
+  const register_sequential = (queue_name: string, handler: Handler) =>
+    sequential_processors.set(queue_name, handler);
+
+  const assert_queue = async (queue_id: number, { paused }: { paused?: boolean} = {}) => {
     if (paused !== undefined) {
       await knex.raw(`
-        INSERT INTO paused (name, paused)
-        VALUES (:name, :paused)
-        ON CONFLICT (name) DO UPDATE SET paused=:paused
-      `, { name, paused });
+        INSERT INTO paused (queue_id, paused)
+        VALUES (:queue_id, :paused)
+        ON CONFLICT (queue_id) DO UPDATE SET paused=:paused
+      `, { queue_id, paused });
     } else {
       await knex.raw(`
-        INSERT INTO paused (name, paused)
-        VALUES (:name, FALSE)
-        ON CONFLICT (name) DO NOTHING
-      `, { name });
+        INSERT INTO paused (queue_id, paused)
+        VALUES (:queue_id, FALSE)
+        ON CONFLICT (queue_id) DO NOTHING
+      `, { queue_id });
     }
 
     return {
       pause: async () => {
         await knex.raw(`
-          INSERT INTO paused (name, paused)
-          VALUES (:name, 't')
-          ON CONFLICT (name) DO UPDATE SET paused='t'
-        `, { name });
+          INSERT INTO paused (queue_id, paused)
+          VALUES (:queue_id, 't')
+          ON CONFLICT (queue_id) DO UPDATE SET paused='t'
+        `, { queue_id });
       },
       resume: async () => {
         await knex.raw(`
-          INSERT INTO paused (name, paused)
-          VALUES (:name, 'f')
-          ON CONFLICT (name) DO UPDATE SET paused='f'
-        `, { name });
+          INSERT INTO paused (queue_id, paused)
+          VALUES (:queue_id, 'f')
+          ON CONFLICT (queue_id) DO UPDATE SET paused='f'
+        `, { queue_id });
       },
       enqueue: async (data: any, options: PublishConfig = {}) => {
-        const payload = JSON.stringify(data);
-        await knex.raw(`
-          INSERT INTO :name: (payload, ready)
-          VALUES (:payload, CURRENT_TIMESTAMP + INTERVAL '${Number(options.delay) || 0} milliseconds')
-        `, { name, payload });
+        const concurrent_payload = JSON.stringify(data);
+        return await knex('queue').insert({ queue_id, concurrent_payload });
       },
-      process: async (handler: Handler) => {
-        const emitter = new EventEmitter();
-        (async () => {
-          while (true) {
-            try {
-              await process_job(name, handler);
-            } catch (error) {
-              emitter.emit('error', error);
-            }
-          }
-        })();
-        return emitter;
-      },
-      complete: async (handler: Handler) => {
-        const emitter = new EventEmitter();
-        (async () => {
-          while (true) {
-            try {
-              await complete_job(name, handler);
-            } catch (error) {
-              emitter.emit('error', error);
-            }
-          }
-        })();
-        return emitter;
-      }
+      do_the_dew: () => get_job(0)
+      // process: async (handler: Handler) => {
+      //   const emitter = new EventEmitter();
+      //   (async () => {
+      //     while (true) {
+      //       try {
+      //         await process_job(name, handler);
+      //       } catch (error) {
+      //         emitter.emit('error', error);
+      //       }
+      //     }
+      //   })();
+      //   return emitter;
+      // },
+      // complete: async (handler: Handler) => {
+      //   const emitter = new EventEmitter();
+      //   (async () => {
+      //     while (true) {
+      //       try {
+      //         await complete_job(name, handler);
+      //       } catch (error) {
+      //         emitter.emit('error', error);
+      //       }
+      //     }
+      //   })();
+      //   return emitter;
+      // }
     }
   };
 
   return {
+    register_concurrent,
+    register_sequential,
     assert_queue
   }
 }

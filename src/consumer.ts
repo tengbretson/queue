@@ -23,25 +23,28 @@ const sleep = (t: number) => new Promise(resolve => setTimeout(resolve, t));
 
 (async () => {
   const client = await make_client(config);
-  const queue = await client.assert_queue('my_queue');
+  const queue = await client.assert_queue(13);
 
-  const processor = await queue.process(async payload => {
-    await sleep(900); // simulate the part of the task that can be run concurrently
-    console.log('processed', payload.number, 'on', process.pid);
-    return;
-  });
+  var t = await queue.do_the_dew();
+  console.log(t);
 
-  processor.on('error', error => {
-    console.error(error);
-  })
+  // const processor = await queue.process(async payload => {
+  //   await sleep(900); // simulate the part of the task that can be run concurrently
+  //   console.log('processed', payload.number, 'on', process.pid);
+  //   return;
+  // });
+
+  // processor.on('error', error => {
+  //   console.error(error);
+  // })
   
-  const sender = await queue.complete(async payload => {
-    await sleep(200); // simulate the part of the task that can must be run sequentially
-    console.log('sent', payload.number, 'on', process.pid);
-    return;
-  });
+  // const sender = await queue.complete(async payload => {
+  //   await sleep(200); // simulate the part of the task that can must be run sequentially
+  //   console.log('sent', payload.number, 'on', process.pid);
+  //   return;
+  // });
   
-  sender.on('error', error => {
-    console.error(error);
-  });
+  // sender.on('error', error => {
+  //   console.error(error);
+  // });
 })();
